@@ -6791,9 +6791,14 @@ function ltpCell(
     close = 0
 ) {
 
-    // STRICT LTP DISPLAY: never substitute previous close for LTP.
-    // The close is historical data, not the live traded price.
-    const n = Number(value);
+    // During the live session show only the live LTP. After the market
+    // closes, fall back to the last saved closing/last-traded value.
+    const liveValue = Number(value);
+    const closeValue = Number(close);
+    const marketClosed = currentData && currentData.market_open === false;
+    const n = marketClosed && (!Number.isFinite(liveValue) || liveValue <= 0)
+        && Number.isFinite(closeValue) && closeValue > 0
+        ? closeValue : liveValue;
 
     if (
         !Number.isFinite(n)
@@ -7577,11 +7582,16 @@ function updateHeaderFromPayload(data) {
             diagnostic.textContent = "WS CONNECTED • NO FRESH TICK • RAW: " + (data.raw_ws_messages || 0) + " • LAST TOKEN: " + (data.last_ws_token || "--");
         }
     }
-    // STRICT LIVE LTP: do not show previous close as Spot while waiting
-    // for an Angel One live tick.
+    // Live session: show live LTP. Closed session: show the saved close
+    // if a live LTP is unavailable.
     const liveNiftyLtp = Number(data.nifty?.ltp || 0);
+    const savedNiftyClose = Number(data.nifty?.close || 0);
+    const shownNifty = liveNiftyLtp > 0 ? liveNiftyLtp
+        : (data.market_open === false && savedNiftyClose > 0 ? savedNiftyClose : 0);
     const spot = document.getElementById("spot");
-    if (spot) spot.textContent = "Spot: " + (liveNiftyLtp > 0 ? fmt(liveNiftyLtp) : "--") + " [" + (data.nifty?.ltp_source || "WAITING") + "]";
+    const spotSource = liveNiftyLtp > 0 ? (data.nifty?.ltp_source || "LIVE")
+        : (shownNifty > 0 ? "LAST CLOSE" : "WAITING");
+    if (spot) spot.textContent = "Spot: " + (shownNifty > 0 ? fmt(shownNifty) : "--") + " [" + spotSource + "]";
     const atm = document.getElementById("atm");
     if (atm) atm.textContent = "ATM: " + fmt(data.atm, 0);
     const wsEl = document.getElementById("ws");
@@ -8950,14 +8960,17 @@ def load_last_ltp_from_supabase():
 
     try:
         url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_SNAPSHOT_TABLE}"
+        # Search recent records for the newest VALID quote. The recorder can
+        # also write zero-valued diagnostic snapshots while Angel's stream is
+        # disconnected; those must not hide an older valid market snapshot.
         params = {
-            "select": "snapshot_time,nifty,last_update",
+            "select": "id,snapshot_time,nifty,last_update",
             "order": "snapshot_time.desc,id.desc",
-            "limit": "1",
+            "limit": "500",
         }
         response = requests.get(
             url, headers=_cloud_recorder_headers(), params=params,
-            timeout=(5, 12),
+            timeout=(5, 20),
         )
         if response.status_code >= 300:
             raise RuntimeError(
@@ -8968,23 +8981,58 @@ def load_last_ltp_from_supabase():
             print("SUPABASE LTP RESTORE: no saved snapshots found.", flush=True)
             return False
 
-        record = records[0]
+        record = None
+        for candidate in records:
+            candidate_quote = candidate.get("nifty") or {}
+            if not isinstance(candidate_quote, dict):
+                continue
+            candidate_ltp = safe_float(candidate_quote.get("ltp"))
+            candidate_close = safe_float(candidate_quote.get("close"))
+            if candidate_ltp > 0 or candidate_close > 0:
+                record = candidate
+                break
+        if record is None:
+            print("SUPABASE LTP RESTORE: no snapshot contains a positive LTP/close.", flush=True)
+            return False
+
+        # Fetch the option-chain JSON only for the selected valid snapshot,
+        # avoiding a large response containing hundreds of historical chains.
+        record_id = record.get("id")
+        if record_id is not None:
+            rows_response = requests.get(
+                url,
+                headers=_cloud_recorder_headers(),
+                params={"select": "rows,expiry", "id": f"eq.{record_id}", "limit": "1"},
+                timeout=(5, 15),
+            )
+            if rows_response.status_code >= 300:
+                raise RuntimeError(
+                    f"Supabase option snapshot HTTP {rows_response.status_code}: "
+                    f"{rows_response.text[:300]}"
+                )
+            row_records = rows_response.json() or []
+            if row_records:
+                record["rows"] = row_records[0].get("rows") or []
+                record["expiry"] = row_records[0].get("expiry")
+
         quote = record.get("nifty") or {}
         if not isinstance(quote, dict):
             quote = {}
         ltp = safe_float(quote.get("ltp"))
         close = safe_float(quote.get("close"))
-        # At the close, some broker responses expose the official close field
-        # rather than lastTradedPrice. Both represent the last available spot.
+        # Prefer the last actual trade; use the broker close only if no LTP
+        # was captured in the selected snapshot.
         restored_price = ltp if ltp > 0 else close
         if restored_price <= 0:
-            print("SUPABASE LTP RESTORE: latest snapshot has no positive LTP/close.", flush=True)
+            print("SUPABASE LTP RESTORE: selected snapshot has no positive LTP/close.", flush=True)
             return False
 
         stamp = str(
             quote.get("ltp_updated") or quote.get("time") or
             record.get("last_update") or record.get("snapshot_time") or ""
         )
+        restored_option_count = 0
+        saved_rows = record.get("rows") or []
         with data_lock:
             # Cloud is the persistent latest snapshot and therefore supersedes
             # any older local cache after a container restart.
@@ -8999,10 +9047,41 @@ def load_last_ltp_from_supabase():
             nifty_data["ltp_source"] = "LAST TRADED (SUPABASE)"
             nifty_data["ltp_updated"] = stamp
 
+            # Restore the last saved option-chain values too. These are
+            # historical snapshot values, not falsely labelled live ticks.
+            for saved_row in saved_rows:
+                if not isinstance(saved_row, dict):
+                    continue
+                for side in ("ce", "pe"):
+                    option = saved_row.get(side) or {}
+                    if not isinstance(option, dict):
+                        continue
+                    symbol = str(option.get("symbol") or "").strip()
+                    if not symbol:
+                        continue
+                    option_ltp = safe_float(option.get("ltp"))
+                    option_close = safe_float(option.get("close"))
+                    option_price = option_ltp if option_ltp > 0 else option_close
+                    target = ensure_live_symbol(symbol)
+                    if option_price > 0:
+                        target["ltp"] = option_price
+                    if option_close > 0:
+                        target["close"] = option_close
+                    target["volume"] = safe_int(option.get("volume"))
+                    target["oi"] = safe_int(option.get("oi"))
+                    target["oi_change"] = safe_int(option.get("oi_change"))
+                    target["percent_change"] = safe_float(option.get("percent_change"))
+                    target["ltp_source"] = "LAST SNAPSHOT (SUPABASE)"
+                    target["ltp_updated"] = stamp
+                    target["time"] = stamp
+                    restored_option_count += 1
+
         save_ltp_cache()
         print(
             "SUPABASE LAST TRADED NIFTY LTP RESTORED:",
-            f"{restored_price:.2f}", stamp, flush=True,
+            f"{restored_price:.2f}", stamp,
+            "| OPTION SNAPSHOT ROWS:", restored_option_count,
+            flush=True,
         )
         return True
     except Exception as restore_error:
@@ -9096,6 +9175,7 @@ def _cloud_recorder_save_payload(payload):
 
 def _cloud_recorder_loop():
     global cloud_recorder_running
+    close_snapshot_saved_date = ""
 
     with cloud_recorder_lock:
         cloud_recorder_running = True
@@ -9104,9 +9184,34 @@ def _cloud_recorder_loop():
         while not cloud_recorder_stop.is_set():
             now = now_ist()
 
-            if now.weekday() >= 5 or now.time() > datetime.strptime(
-                "15:30", "%H:%M"
-            ).time():
+            # Capture one final end-of-session snapshot from today's last
+            # received Angel tick. Never write an empty post-restart value.
+            if now.weekday() < 5 and now.time() > datetime.strptime("15:30", "%H:%M").time():
+                date_s = now.strftime("%Y-%m-%d")
+                last_tick = safe_float(state.get("last_nifty_tick_at", 0))
+                last_price = safe_float(nifty_data.get("ltp"))
+                tick_is_today = False
+                if last_tick > 0:
+                    try:
+                        tick_is_today = datetime.fromtimestamp(last_tick, IST).date() == now.date()
+                    except Exception:
+                        tick_is_today = False
+                tick_is_fresh = last_tick > 0 and (time.time() - last_tick) <= 600
+                if (close_snapshot_saved_date != date_s and tick_is_today
+                        and tick_is_fresh and last_price > 0):
+                    try:
+                        final_payload = make_payload()
+                        _cloud_recorder_save_payload(final_payload)
+                        close_snapshot_saved_date = date_s
+                        print("CLOUD RECORDER FINAL CLOSE SNAPSHOT SAVED:", date_s,
+                              f"NIFTY={last_price:.2f}", flush=True)
+                    except Exception as close_error:
+                        print("CLOUD RECORDER FINAL CLOSE SNAPSHOT WARNING:",
+                              repr(close_error), flush=True)
+                cloud_recorder_stop.wait(30)
+                continue
+
+            if now.weekday() >= 5:
                 cloud_recorder_stop.wait(30)
                 continue
 
