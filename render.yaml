@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: nifty-ltp-shift-recorder
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn render_app:app --workers 1 --threads 8 --timeout 180 --bind 0.0.0.0:$PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: CLOUD_RECORDER_ENABLED
+        value: "true"
+      - key: CLOUD_RECORDER_MANUAL
+        value: "false"
+      - key: CLOUD_RECORDER_INTERVAL
+        value: "60"
+      - key: ENABLE_TRADING
+        value: "false"
+      - key: PYTHONUNBUFFERED
+        value: "true"

@@ -8934,6 +8934,82 @@ def _cloud_recorder_post(table, rows, on_conflict=None):
         )
 
 
+def load_last_ltp_from_supabase():
+    """Restore the most recent saved NIFTY quote after a Render restart.
+
+    Render's local filesystem is ephemeral, so LAST_LTP_CACHE alone cannot
+    guarantee a last-traded price outside market hours.  The cloud snapshot
+    table is the durable fallback.  This function is intentionally used only
+    while the exchange is closed; it never overwrites a live-session quote.
+    """
+    if is_market_open():
+        return False
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        print("SUPABASE LTP RESTORE SKIPPED: credentials not configured.", flush=True)
+        return False
+
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_SNAPSHOT_TABLE}"
+        params = {
+            "select": "snapshot_time,nifty,last_update",
+            "order": "snapshot_time.desc,id.desc",
+            "limit": "1",
+        }
+        response = requests.get(
+            url, headers=_cloud_recorder_headers(), params=params,
+            timeout=(5, 12),
+        )
+        if response.status_code >= 300:
+            raise RuntimeError(
+                f"HTTP {response.status_code}: {response.text[:400]}"
+            )
+        records = response.json() or []
+        if not records:
+            print("SUPABASE LTP RESTORE: no saved snapshots found.", flush=True)
+            return False
+
+        record = records[0]
+        quote = record.get("nifty") or {}
+        if not isinstance(quote, dict):
+            quote = {}
+        ltp = safe_float(quote.get("ltp"))
+        close = safe_float(quote.get("close"))
+        # At the close, some broker responses expose the official close field
+        # rather than lastTradedPrice. Both represent the last available spot.
+        restored_price = ltp if ltp > 0 else close
+        if restored_price <= 0:
+            print("SUPABASE LTP RESTORE: latest snapshot has no positive LTP/close.", flush=True)
+            return False
+
+        stamp = str(
+            quote.get("ltp_updated") or quote.get("time") or
+            record.get("last_update") or record.get("snapshot_time") or ""
+        )
+        with data_lock:
+            # Cloud is the persistent latest snapshot and therefore supersedes
+            # any older local cache after a container restart.
+            nifty_data["ltp"] = restored_price
+            if close > 0:
+                nifty_data["close"] = close
+            for field in ("open", "high", "low", "change", "percent_change"):
+                value = safe_float(quote.get(field))
+                if value or field in ("change", "percent_change"):
+                    nifty_data[field] = value
+            nifty_data["time"] = str(quote.get("time") or stamp)
+            nifty_data["ltp_source"] = "LAST TRADED (SUPABASE)"
+            nifty_data["ltp_updated"] = stamp
+
+        save_ltp_cache()
+        print(
+            "SUPABASE LAST TRADED NIFTY LTP RESTORED:",
+            f"{restored_price:.2f}", stamp, flush=True,
+        )
+        return True
+    except Exception as restore_error:
+        print("SUPABASE LTP RESTORE ERROR:", repr(restore_error), flush=True)
+        return False
+
+
 def _cloud_event_key(date_s, side, event):
     payload = {
         "date": date_s,
@@ -9201,6 +9277,9 @@ def startup():
     # During closed hours it remains useful as the requested last-known fallback.
     if not is_market_open():
         load_ltp_cache()
+        # Prefer the persistent cloud snapshot over Render's ephemeral local
+        # cache so the previous trading session's LTP survives restarts.
+        load_last_ltp_from_supabase()
 
     # --------------------------------------------------------
     # Login.
