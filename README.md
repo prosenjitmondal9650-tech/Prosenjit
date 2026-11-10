@@ -1,34 +1,53 @@
-# NIFTY LTP Shift Recorder
+# NIFTY LTP Shift Recorder — Free-first Render package
 
-এই repository-তে NIFTY LTP Shift Recorder-এর Python Flask application এবং PythonAnywhere WSGI entry point রাখা হয়েছে।
+এই ZIP-এ আপনার মূল Angel One engine রাখা হয়েছে। Render চালানোর entry point,
+health check, automatic market-time recorder এবং Supabase cloud snapshot persistence
+কনফিগার করা আছে।
 
-## Repository files
+## কী স্বয়ংক্রিয় হবে
+- সার্ভার চালু হলে engine নিজে startup/login চেষ্টা করবে।
+- Angel One Smart WebSocket নিজে reconnect করার চেষ্টা করবে।
+- সোমবার–শুক্রবার 09:15–15:30 IST সময়ের মধ্যে cloud recorder প্রতি 60 সেকেন্ডে
+  snapshot পাঠাবে; CALL/PUT-এর প্রকৃত SHIFT হলে history row-ও সংরক্ষণ করবে।
+- 15:30-এর পরে recorder আর snapshot নেবে না; পরের দিনে একই সময়সীমায় আবার চালু হবে।
+- `/health` endpoint Render health check এবং UptimeRobot monitor-এর জন্য আছে।
+- Gunicorn এক worker-এ চলবে, কারণ live WebSocket/state এক process-এ থাকা জরুরি।
 
-- `9_LTP_SHIFT_ENGINE_SR_FIXED_ANGEL_VOLUME_SYNC.py` — মূল application
-- `requirements.txt` — Python dependencies
-- `wsgi.py` — PythonAnywhere WSGI loader
-- `.env.example` — প্রয়োজনীয় environment variable-এর নামের নমুনা; এখানে কোনো আসল secret নেই
-- `.gitignore` — cache, runtime data এবং secret Git-এ upload হওয়া আটকায়
+## একবারের সেটআপ
+1. ZIP extract করুন; ভেতরের `Prosenjit-main` ফোল্ডারের সব ফাইল GitHub/GitLab repo-র root-এ push করুন।
+2. Supabase-এ project তৈরি করে SQL Editor-এ `supabase_schema.sql` সম্পূর্ণ Run করুন।
+3. Render → New → Blueprint → আপনার Git repo connect → `render.yaml` Apply করুন।
+4. Render service → Environment-এ এই 6টি মান দিন:
+   - `ANGEL_API_KEY`
+   - `ANGEL_CLIENT_CODE`
+   - `ANGEL_MPIN`
+   - `ANGEL_TOTP_SECRET`
+   - `SUPABASE_URL`
+   - `SUPABASE_SERVICE_ROLE_KEY`
+5. Save/Deploy করুন। Logs-এ Angel One login success, instrument master এবং WebSocket CONNECTED দেখুন।
+6. `https://YOUR-SERVICE.onrender.com/health` খুলে JSON-এ `"ok": true` দেখুন।
 
-## GitHub-এ upload
+## UptimeRobot Keep-Alive
+1. UptimeRobot Free account-এ Add New Monitor করুন।
+2. Type: HTTP(s); Friendly Name: `NIFTY-LTP-KEEP-ALIVE`
+3. URL: `https://YOUR-SERVICE.onrender.com/health`
+4. Interval: 5 minutes (Free account-এ option থাকলে)।
+5. Save করে monitor-টি UP দেখুন।
 
-সব ফাইল repository-র root folder-এ upload করুন। `.github` বা অন্য কোনো অতিরিক্ত deployment workflow এই package-এ নেই। GitHub এখানে source-code repository; শুধু GitHub-এ upload করলেই application 24/7 চালু হবে না।
+## গুরুত্বপূর্ণ বাস্তব সীমাবদ্ধতা
+- Render Free-তে sleep/restart পুরোপুরি বন্ধ করার কোনো supported guarantee নেই।
+  UptimeRobot-এর ping idle sleep কমাতে/এড়াতে পারে, কিন্তু Render-এর restart, deploy,
+  outage বা network interruption আটকাতে পারে না। তাই "কখনো sleep হবে না" বলা যাবে না।
+- Render Free-তে প্রতিটি market tick 100% capture হওয়ার নিশ্চয়তা নেই।
+- Cloud snapshot/history Supabase-এ থাকে; কিন্তু engine-এর সম্পূর্ণ UI-তে পুরোনো দিনের
+  cloud history restore/display workflow এখনো যুক্ত নয়। Snapshot হলো প্রতি মিনিটের
+  capture, প্রতিটি tick নয়।
+- সপ্তাহের দিন দেখে market window নির্ধারিত হয়। NSE special holiday/holiday calendar
+  automatic verify করা হয়নি; সরকারি ছুটির দিনে app বন্ধ/paused রাখতে হবে।
+- 09:15/15:30 হলো recorder window; WebSocket background connection process চালু থাকা
+  পর্যন্ত reconnect চেষ্টা করতে পারে। এটি Render host-কে জাগিয়ে রাখার নিশ্চয়তা নয়।
+- Trading/order execution `ENABLE_TRADING=false`; স্বয়ংক্রিয় order place করে না।
+- Angel One এবং Supabase credentials কখনো Git repo বা ZIP-এ বসাবেন না।
 
-## PythonAnywhere setup
-
-1. Repository clone/pull করে সব root file `/home/YOUR_USERNAME/mysite/`-এ রাখুন।
-2. Python 3.11 virtualenv-এ চালান: `pip install -r requirements.txt`।
-3. Web tab-এর WSGI configuration file-এ এই repository-র `wsgi.py`-এর content ব্যবহার করুন; `PROJECT_DIR` আপনার `mysite` path-এর সঙ্গে মিলিয়ে নিন।
-4. Web app-এর environment variables-এ `.env.example`-এ থাকা প্রয়োজনীয় Angel One values সেট করুন। Supabase ব্যবহার করলে তার values-ও দিন।
-5. Web app Reload করুন এবং `/health` endpoint পরীক্ষা করুন।
-
-## Security
-
-- `ANGEL_API_KEY`, `ANGEL_MPIN`, `ANGEL_TOTP_SECRET`, `SUPABASE_SERVICE_ROLE_KEY` কখনো GitHub-এ লিখবেন না।
-- এগুলো hosting provider-এর Environment Variables / Secrets-এ রাখুন।
-- `.env` ফাইল commit করবেন না।
-- `ENABLE_TRADING` ডিফল্টভাবে `false`; প্রয়োজন ও যথাযথ যাচাই ছাড়া এটি চালু করবেন না।
-
-## Notes
-
-এই README repository packaging ও deployment steps বর্ণনা করে; live market data, broker access, hosting uptime বা free-tier background execution নিশ্চিত করে না।
+## Start command
+`gunicorn render_app:app --workers 1 --threads 8 --timeout 180 --bind 0.0.0.0:$PORT`

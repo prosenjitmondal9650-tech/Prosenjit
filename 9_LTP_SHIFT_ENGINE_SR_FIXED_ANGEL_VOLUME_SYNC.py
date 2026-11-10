@@ -8985,16 +8985,15 @@ def _cloud_recorder_save_payload(payload):
                 "raw_event": event,
             })
 
-    # IMPORTANT: do not create a recorder entry/snapshot when there is no
-    # completed SHIFT. This keeps total entries equal to actual shifts only.
-    if not shift_rows:
-        return
-
-    _cloud_recorder_post(
-        SUPABASE_SHIFT_TABLE, shift_rows, "event_key"
-    )
-    for row in shift_rows:
-        cloud_recorder_seen_events.add(row["event_key"])
+    # Persist only actual SHIFT events in the history table, but always
+    # persist the latest market snapshot. This preserves last-known data even
+    # during quiet periods when no new shift event is generated.
+    if shift_rows:
+        _cloud_recorder_post(
+            SUPABASE_SHIFT_TABLE, shift_rows, "event_key"
+        )
+        for row in shift_rows:
+            cloud_recorder_seen_events.add(row["event_key"])
 
     snapshot = {
         "snapshot_time": now.isoformat(),
