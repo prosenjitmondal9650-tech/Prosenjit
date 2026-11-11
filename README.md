@@ -78,3 +78,15 @@ logged before tick processing, helping distinguish subscription success from
 actual market-data delivery. Credentials remain in Render environment variables;
 never put API keys, PINs, passwords or TOTP values in source files.
 
+
+## Dashboard SSE snapshot envelope fix
+
+The server's `/api/tick-stream` sends its initial `snapshot` event as a
+`full_snapshot` envelope containing the actual dashboard payload under
+`payload`. The browser now passes this envelope through `applyTickDelta()`
+so it unwraps and renders the payload correctly. Previously the browser passed
+the envelope directly to `applyLivePayload()`, causing the initial dashboard
+status to display `DISCONNECTED / RAW: 0` even while Render logs showed
+Angel One binary frames arriving. A received NIFTY delta also updates the
+visible diagnostic label to confirm browser-side delivery.
+

@@ -7808,6 +7808,8 @@ function applyTickDelta(d) {
         return;
     }
     if (d.type === "nifty") {
+        // A real NIFTY delta proves the server stream is delivering live data.
+        // Refresh the status label from the latest server payload when present.
         const n = Number(d.ltp || 0);
         window.liveStreamHasTicks = true;
         if (currentData) {
@@ -7820,6 +7822,11 @@ function applyTickDelta(d) {
         updateLiveCandleFromTick(n, Number(d.tick_ms || Date.now()), Number(d.volume || 0));
         const spot = document.getElementById("spot");
         if (spot && n > 0) spot.textContent = "Spot: " + fmt(n) + " [LIVE]";
+        const diag = document.getElementById("diagnostic") || document.getElementById("error");
+        if (diag) {
+            diag.textContent = "LIVE RAW TICK • ANGEL ONE • NIFTY: LIVE";
+            diag.title = "Live NIFTY tick received by the browser SSE stream";
+        }
         return;
     }
     if (d.type !== "option") return;
@@ -7850,7 +7857,11 @@ function connectTickStream() {
     if (tickStream) tickStream.close();
     tickStream = new EventSource(window.location.origin + "/api/tick-stream");
     tickStream.addEventListener("snapshot", ev => {
-        try { applyLivePayload(JSON.parse(ev.data)); } catch(e) { console.error(e); }
+        // /api/tick-stream sends an SSE envelope:
+        // {type:"full_snapshot", payload:{...}}.
+        // Unwrap it through applyTickDelta before rendering the payload.
+        try { applyTickDelta(JSON.parse(ev.data)); }
+        catch(e) { console.error("SSE snapshot apply error:", e); }
     });
     tickStream.addEventListener("tick", ev => {
         try { applyTickDelta(JSON.parse(ev.data)); } catch(e) { console.error(e); }
