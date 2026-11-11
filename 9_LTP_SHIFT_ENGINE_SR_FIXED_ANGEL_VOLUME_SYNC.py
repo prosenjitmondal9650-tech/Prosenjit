@@ -3125,6 +3125,14 @@ def websocket_on_error(wsapp=None, error=None, *extra):
     state["websocket"] = "ERROR"
     state["last_error"] = "Angel Smart Stream: " + str(reason)
     print("ANGEL ONE WS ERROR RAW:", repr(reason), flush=True)
+    # Force the outer reconnect loop to regain control if the SDK leaves a
+    # failed socket open after an error callback.
+    current = active_sws
+    if current is not None:
+        try:
+            current.close_connection()
+        except Exception as close_error:
+            print("Angel WS close-after-error warning:", repr(close_error), flush=True)
 
 
 def websocket_on_close(wsapp):
@@ -3132,20 +3140,16 @@ def websocket_on_close(wsapp):
     state["websocket"] = "DISCONNECTED"
     with subscribed_tokens_lock:
         subscribed_option_tokens = set()
-    print("Angel One SmartWebSocketV2 closed.", flush=True)
+    print("Angel One SmartWebSocketV2 closed; reconnect loop will retry.", flush=True)
 
 
 def start_websocket():
-    """Run Angel One's official SmartWebSocketV2 directly.
-
-    This removes the custom WebSocketApp wrapper that caused subscribe() to be
-    called on the wrong object. The official SDK owns the raw socket and its
-    subscribe/resubscribe protocol.
-    """
+    """Run Angel One SmartWebSocketV2 with an explicit outer reconnect loop."""
     global ws, feed_token, active_sws
     print("Starting OFFICIAL Angel One SmartWebSocketV2", flush=True)
     failure_count = 0
     while running:
+        client = None
         try:
             if not state.get("logged_in"):
                 if not angel_login():
@@ -3171,20 +3175,42 @@ def start_websocket():
             client.on_data = websocket_on_data
             client.on_error = websocket_on_error
             client.on_close = websocket_on_close
+            print("Angel SmartWebSocketV2 connect() starting", flush=True)
             client.connect()
-            failure_count = 0
+            # connect() normally blocks until the socket closes. If it returns,
+            # treat that as a disconnect rather than silently starting over.
+            failure_count += 1
+            state["websocket"] = "DISCONNECTED"
+            state["last_error"] = "Angel Smart Stream ended; reconnecting"
+            print("Angel SmartWebSocketV2 connect() returned; reconnecting", flush=True)
         except Exception as e:
             failure_count += 1
             state["websocket"] = "ERROR"
             state["last_error"] = "Angel Smart WS connection: " + str(e)
             print("ANGEL SMART WS CONNECTION ERROR:", repr(e), flush=True)
-            if failure_count >= 3:
+        finally:
+            if client is not None:
                 try:
-                    relogin()
-                except Exception as re:
-                    print("ANGEL SMART WS re-login error:", repr(re), flush=True)
-                failure_count = 0
-            time.sleep(WS_RECONNECT_SECONDS)
+                    client.close_connection()
+                except Exception:
+                    pass
+            if active_sws is client:
+                active_sws = None
+            if ws is client:
+                ws = None
+            with subscribed_tokens_lock:
+                subscribed_option_tokens.clear()
+
+        if not running:
+            break
+        if failure_count >= 3:
+            try:
+                print("Angel WS reconnect threshold reached; refreshing login session", flush=True)
+                relogin()
+            except Exception as re:
+                print("ANGEL SMART WS re-login error:", repr(re), flush=True)
+            failure_count = 0
+        time.sleep(WS_RECONNECT_SECONDS)
 
 # ============================================================
 # WEBSOCKET WATCHDOG
