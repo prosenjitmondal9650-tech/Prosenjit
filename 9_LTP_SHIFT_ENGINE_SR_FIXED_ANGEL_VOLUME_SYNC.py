@@ -7846,7 +7846,10 @@ function connectTickStream() {
     if (tickStream) tickStream.close();
     tickStream = new EventSource(window.location.origin + "/api/tick-stream");
     tickStream.addEventListener("snapshot", ev => {
-        try { applyLivePayload(JSON.parse(ev.data)); } catch(e) { console.error(e); }
+        // The server sends {type:"full_snapshot", payload:{...}}.
+        // Route it through the same envelope handler used by live tick events;
+        // passing the envelope directly to applyLivePayload() leaves the UI blank.
+        try { applyTickDelta(JSON.parse(ev.data)); } catch(e) { console.error("SSE snapshot parse/apply error:", e); }
     });
     tickStream.addEventListener("tick", ev => {
         try { applyTickDelta(JSON.parse(ev.data)); } catch(e) { console.error(e); }

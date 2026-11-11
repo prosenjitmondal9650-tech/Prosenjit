@@ -69,3 +69,14 @@ health check, automatic market-time recorder এবং Supabase cloud snapshot p
 - Ping/pong frame-কে market tick হিসেবে গণনা করা হবে না।
 - No-market-frame watchdog 15 সেকেন্ড পরে reconnect করবে এবং কারণটি Render log-এ লিখবে।
 - Render-এর Angel One credentials আগের মতো Environment-এই রাখতে হবে; ZIP-এ কোনো secret নেই।
+
+
+## Dashboard live snapshot fix
+
+The `/api/tick-stream` endpoint sends its initial browser event as an envelope:
+`{ "type": "full_snapshot", "payload": ... }`. The dashboard now routes the
+` snapshot ` event through `applyTickDelta()`, which unwraps that envelope before
+rendering the snapshot. Previously it passed the envelope directly to
+`applyLivePayload()`, so initial NIFTY/option-chain values could appear blank
+until a later event arrived.
+
