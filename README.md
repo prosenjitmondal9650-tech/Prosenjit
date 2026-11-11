@@ -62,3 +62,10 @@ health check, automatic market-time recorder এবং Supabase cloud snapshot p
 - Build command: `pip install -r requirements.txt`
 - Start command: `gunicorn render_app:app --workers 1 --threads 8 --timeout 180 --bind 0.0.0.0:$PORT`
 - GitLab repo-র root-এ ZIP extract করে `Prosenjit-main` ফোল্ডারের ভেতরের ফাইলগুলো রাখুন; অতিরিক্ত nested folder তৈরি করবেন না।
+
+## Live WebSocket callback compatibility update
+- Smart Stream callback এখন dict এবং raw binary frame—দুই ধরনের payload গ্রহণ করতে পারে।
+- SDK callback-এর অতিরিক্ত arguments থাকলেও handler crash করবে না।
+- Ping/pong frame-কে market tick হিসেবে গণনা করা হবে না।
+- No-market-frame watchdog 15 সেকেন্ড পরে reconnect করবে এবং কারণটি Render log-এ লিখবে।
+- Render-এর Angel One credentials আগের মতো Environment-এই রাখতে হবে; ZIP-এ কোনো secret নেই।

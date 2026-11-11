@@ -3105,12 +3105,41 @@ def websocket_on_open(wsapp):
         print("ANGEL SMART WS SUBSCRIBE ERROR:", repr(e), flush=True)
 
 
-def websocket_on_data(wsapp, message):
+def websocket_on_data(wsapp, message, *callback_extra):
+    """Accept both SmartApi SDK callback payloads and raw binary frames.
+
+    SDK releases have differed in the callback argument shape.  Keep the
+    callback tolerant, but count only actual market-data payloads (not pongs).
+    """
     try:
+        payload = message
+        if isinstance(payload, str):
+            if payload.strip().lower() in ("pong", "ping", ""):
+                return
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                state["last_error"] = "Angel WS text frame: " + payload[:250]
+                print("ANGEL WS TEXT FRAME:", payload[:300], flush=True)
+                return
+
+        if isinstance(payload, (bytes, bytearray)):
+            payload = DirectAngelOneWS.parse_packet(payload)
+            if payload is None:
+                state["last_error"] = "Angel WS binary frame could not be decoded"
+                return
+
+        if isinstance(payload, dict) and isinstance(payload.get("data"), dict) and not payload.get("token"):
+            payload = payload["data"]
+
+        if not isinstance(payload, dict):
+            state["last_error"] = "Unsupported Angel WS payload: " + type(payload).__name__
+            return
+
         state["raw_ws_messages"] = safe_int(state.get("raw_ws_messages", 0)) + 1
         state["last_ws_message_at"] = time.time()
         state["last_market_packet_at"] = time.time()
-        process_tick(message)
+        process_tick(payload)
     except Exception as e:
         state["last_error"] = "WebSocket tick error: " + str(e)
         print("ANGEL ONE WS TICK ERROR:", repr(e), flush=True)
@@ -3135,9 +3164,11 @@ def websocket_on_error(wsapp=None, error=None, *extra):
             print("Angel WS close-after-error warning:", repr(close_error), flush=True)
 
 
-def websocket_on_close(wsapp):
+def websocket_on_close(wsapp=None, *close_details):
     global subscribed_option_tokens
     state["websocket"] = "DISCONNECTED"
+    if close_details:
+        state["last_error"] = "Angel Smart Stream closed: " + " ".join(str(x) for x in close_details)[:250]
     with subscribed_tokens_lock:
         subscribed_option_tokens = set()
     print("Angel One SmartWebSocketV2 closed; reconnect loop will retry.", flush=True)
@@ -3164,6 +3195,9 @@ def start_websocket():
                 raise RuntimeError("Feed token unavailable")
 
             state["websocket"] = "CONNECTING"
+            state["last_error"] = ""
+            state["ws_connect_started_at"] = time.time()
+            state["ws_reconnects"] = safe_int(state.get("ws_reconnects", 0)) + (1 if failure_count else 0)
             client = SmartWebSocketV2(
                 token, API_KEY, CLIENT_CODE, feed_token,
                 max_retry_attempt=2, retry_strategy=0,
@@ -3175,7 +3209,7 @@ def start_websocket():
             client.on_data = websocket_on_data
             client.on_error = websocket_on_error
             client.on_close = websocket_on_close
-            print("Angel SmartWebSocketV2 connect() starting", flush=True)
+            print("Angel SmartWebSocketV2 connect() starting; SDK=smartapi-python", flush=True)
             client.connect()
             # connect() normally blocks until the socket closes. If it returns,
             # treat that as a disconnect rather than silently starting over.
@@ -3225,10 +3259,10 @@ def websocket_watchdog_loop():
                 # can legitimately be quiet.
                 last_market = safe_float(state.get("last_market_packet_at", 0))
                 age = time.time() - last_market if last_market > 0 else 999
-                if is_market_open() and age > 12:
-                    state["last_error"] = f"Direct WS watchdog: no market tick for {age:.1f}s; reconnecting"
-                    print(f"DIRECT WS WATCHDOG: no market tick for {age:.1f}s", flush=True)
-                    current = ws
+                if is_market_open() and age > 15:
+                    state["last_error"] = f"Angel WS watchdog: no market-data frame for {age:.1f}s; reconnecting"
+                    print(f"ANGEL WS WATCHDOG: no market-data frame for {age:.1f}s; reconnecting", flush=True)
+                    current = active_sws or ws
                     if current is not None:
                         current.close_connection()
             time.sleep(1)
