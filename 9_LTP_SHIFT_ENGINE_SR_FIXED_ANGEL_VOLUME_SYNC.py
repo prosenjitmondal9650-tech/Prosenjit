@@ -5196,6 +5196,44 @@ def api_place_order():
 # POSITIONS
 # ============================================================
 
+def angel_sdk_call_with_relogin(method_name, *args, **kwargs):
+    """Call an authenticated Angel SDK method and refresh an expired session once.
+
+    Render can keep a process alive longer than an Angel JWT.  SDK methods such
+    as position() may return AG8001 in a JSON response instead of raising, so
+    inspect both the response and exceptions before deciding the call succeeded.
+    """
+    global obj
+    method = getattr(obj, method_name, None) if obj is not None else None
+    if not callable(method):
+        if not angel_login():
+            raise RuntimeError(state.get("last_error") or "Angel One login failed")
+        method = getattr(obj, method_name, None)
+    if not callable(method):
+        raise RuntimeError("Angel One SDK method unavailable: " + str(method_name))
+
+    try:
+        result = method(*args, **kwargs)
+        if _greeks_auth_error(result):
+            raise RuntimeError("AG8001: Invalid Token")
+        return result
+    except Exception as exc:
+        message = str(exc).lower()
+        auth_failed = any(code in message for code in ("ag8001", "ab1010", "ab1011", "invalid token", "token expired"))
+        if not auth_failed:
+            raise
+        print("ANGEL SDK: expired JWT detected in", method_name, "-> refreshing session", flush=True)
+        if not angel_login():
+            raise RuntimeError(state.get("last_error") or "Angel One re-login failed") from exc
+        method = getattr(obj, method_name, None)
+        if not callable(method):
+            raise RuntimeError("Angel One SDK method unavailable after re-login: " + str(method_name))
+        result = method(*args, **kwargs)
+        if _greeks_auth_error(result):
+            raise RuntimeError("Angel One still reports AG8001 after fresh login")
+        return result
+
+
 @app.get("/api/positions")
 def api_positions():
 
@@ -5212,7 +5250,7 @@ def api_positions():
 
     try:
 
-        response = obj.position()
+        response = angel_sdk_call_with_relogin("position")
 
         if not response:
 
@@ -5427,7 +5465,7 @@ def api_square_off():
 
     try:
 
-        positions = obj.position()
+        positions = angel_sdk_call_with_relogin("position")
 
         rows = (
             positions.get("data")

@@ -51,3 +51,14 @@ health check, automatic market-time recorder এবং Supabase cloud snapshot p
 
 ## Start command
 `gunicorn render_app:app --workers 1 --threads 8 --timeout 180 --bind 0.0.0.0:$PORT`
+
+## Render-এ `AG8001 Invalid Token` হলে
+- Render → Service → Environment-এ `ANGEL_API_KEY`, `ANGEL_CLIENT_CODE`, `ANGEL_MPIN`, `ANGEL_TOTP_SECRET` সঠিকভাবে সেট আছে কি না দেখুন।
+- এগুলো কখনো GitLab/ZIP-এ লিখবেন না; শুধু Render Environment-এ রাখবেন।
+- এই প্যাকেজে Positions API-র `AG8001`/expired JWT শনাক্ত হলে একবার নতুন Angel One session তৈরি করে request retry করা হয়।
+- নতুন session তৈরির পরও `AG8001` এলে Angel One-এর login/TOTP/API access বা Render Environment value যাচাই করতে হবে। কোনো API key, MPIN, TOTP secret বা JWT কাউকে পাঠাবেন না।
+
+## Deploy check
+- Build command: `pip install -r requirements.txt`
+- Start command: `gunicorn render_app:app --workers 1 --threads 8 --timeout 180 --bind 0.0.0.0:$PORT`
+- GitLab repo-র root-এ ZIP extract করে `Prosenjit-main` ফোল্ডারের ভেতরের ফাইলগুলো রাখুন; অতিরিক্ত nested folder তৈরি করবেন না।
