@@ -1,0 +1,6 @@
+Flask>=3.0,<4
+requests>=2.31,<3
+websocket-client>=1.7,<2
+smartapi-python>=1.5.5
+pyotp>=2.9,<3
+gunicorn>=22,<24
