@@ -1,23 +1,22 @@
 services:
   - type: web
-    name: nifty-ltp-shift-engine
+    name: nifty-ltp-shift-recorder
     runtime: python
-    plan: starter
+    plan: free
+    region: singapore
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --worker-class gthread --workers 1 --threads 16 --timeout 120 --bind 0.0.0.0:$PORT wsgi:app
+    startCommand: gunicorn render_app:app --workers 1 --threads 8 --timeout 180 --bind 0.0.0.0:$PORT
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.11
-      - key: ENABLE_TRADING
-        value: "false"
       - key: CLOUD_RECORDER_ENABLED
         value: "true"
       - key: CLOUD_RECORDER_MANUAL
-        value: "true"
+        value: "false"
       - key: CLOUD_RECORDER_INTERVAL
         value: "60"
-      - key: STRIKES_AROUND_ATM
-        value: "10"
-      - key: NIFTY_LOT_SIZE
-        value: "75"
+      - key: ENABLE_TRADING
+        value: "false"
+      - key: PYTHONUNBUFFERED
+        value: "true"
