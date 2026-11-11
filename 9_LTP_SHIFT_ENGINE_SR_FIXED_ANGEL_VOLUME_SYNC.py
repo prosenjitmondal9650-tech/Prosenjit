@@ -2948,10 +2948,8 @@ class DirectAngelOneWS:
         state["raw_ws_messages"] = safe_int(state.get("raw_ws_messages", 0)) + 1
         state["last_ws_message_at"] = time.time()
         if isinstance(message, str):
-            if message == "pong":
-                # Transport heartbeat only; never treat pong as a market-data tick.
+            if message.strip().lower() in ("pong", "ping"):
                 return
-            # Angel control/error messages are kept for diagnostics.
             if message.strip():
                 state["last_error"] = "DIRECT WS TEXT: " + message[:300]
                 print("DIRECT WS TEXT:", message[:500], flush=True)
@@ -2960,6 +2958,14 @@ class DirectAngelOneWS:
             parsed = self.parse_packet(message)
             if parsed:
                 state["last_ws_token"] = parsed.get("token", "")
+                print(
+                    "ANGEL DIRECT WS FRAME:",
+                    "bytes=", len(message),
+                    "mode=", parsed.get("subscription_mode"),
+                    "exchange=", parsed.get("exchange_type"),
+                    "token=", parsed.get("token"),
+                    flush=True,
+                )
                 # A binary Angel packet is real market-stream traffic. Keep a
                 # separate timestamp so the watchdog can detect a frozen feed
                 # even when websocket ping/pong is still healthy.
@@ -3198,18 +3204,16 @@ def start_websocket():
             state["last_error"] = ""
             state["ws_connect_started_at"] = time.time()
             state["ws_reconnects"] = safe_int(state.get("ws_reconnects", 0)) + (1 if failure_count else 0)
-            client = SmartWebSocketV2(
-                token, API_KEY, CLIENT_CODE, feed_token,
-                max_retry_attempt=2, retry_strategy=0,
-                retry_delay=5, retry_duration=30,
-            )
+            # Bypass the SDK wrapper so every raw Smart Stream frame is
+            # visible to our own decoder and diagnostics before tick processing.
+            client = DirectAngelOneWS(token, API_KEY, CLIENT_CODE, feed_token)
             active_sws = client
             ws = client
             client.on_open = websocket_on_open
             client.on_data = websocket_on_data
             client.on_error = websocket_on_error
             client.on_close = websocket_on_close
-            print("Angel SmartWebSocketV2 connect() starting; SDK=smartapi-python", flush=True)
+            print("Angel Direct Smart Stream connect() starting; SDK wrapper bypassed", flush=True)
             client.connect()
             # connect() normally blocks until the socket closes. If it returns,
             # treat that as a disconnect rather than silently starting over.
@@ -7846,10 +7850,7 @@ function connectTickStream() {
     if (tickStream) tickStream.close();
     tickStream = new EventSource(window.location.origin + "/api/tick-stream");
     tickStream.addEventListener("snapshot", ev => {
-        // The server sends {type:"full_snapshot", payload:{...}}.
-        // Route it through the same envelope handler used by live tick events;
-        // passing the envelope directly to applyLivePayload() leaves the UI blank.
-        try { applyTickDelta(JSON.parse(ev.data)); } catch(e) { console.error("SSE snapshot parse/apply error:", e); }
+        try { applyLivePayload(JSON.parse(ev.data)); } catch(e) { console.error(e); }
     });
     tickStream.addEventListener("tick", ev => {
         try { applyTickDelta(JSON.parse(ev.data)); } catch(e) { console.error(e); }
