@@ -1631,6 +1631,7 @@ def process_tick(message):
             nifty_time = nifty_data.get("time", "")
 
         state["last_nifty_tick_at"] = time.time()
+        state["nifty_tick_count"] = safe_int(state.get("nifty_tick_count", 0)) + 1
         state["tick_count"] = safe_int(state.get("tick_count", 0)) + 1
         state["live_tick_active"] = True
 
@@ -1804,6 +1805,7 @@ def process_tick(message):
         item["last_tick_received_ms"] = received_ms
 
         state["last_option_tick_at"] = received_ms / 1000.0
+        state["option_tick_count"] = safe_int(state.get("option_tick_count", 0)) + 1
         state["tick_count"] = safe_int(state.get("tick_count", 0)) + 1
 
         # Publish the changed option immediately. Browser updates these live cells.
@@ -2945,34 +2947,61 @@ class DirectAngelOneWS:
             self.on_open(self)
 
     def _on_message(self, wsapp, message):
-        state["raw_ws_messages"] = safe_int(state.get("raw_ws_messages", 0)) + 1
-        state["last_ws_message_at"] = time.time()
+        # Count only successfully decoded Angel market-data packets.
+        # Ping/pong and malformed frames must not inflate the live counter.
         if isinstance(message, str):
-            if message.strip().lower() in ("pong", "ping"):
+            if message.strip().lower() in ("pong", "ping", ""):
                 return
-            if message.strip():
-                state["last_error"] = "DIRECT WS TEXT: " + message[:300]
-                print("DIRECT WS TEXT:", message[:500], flush=True)
+            state["last_error"] = "DIRECT WS TEXT: " + message[:300]
+            print("DIRECT WS TEXT:", message[:500], flush=True)
             return
         try:
             parsed = self.parse_packet(message)
-            if parsed:
-                state["last_ws_token"] = parsed.get("token", "")
+            if not parsed:
+                state["ws_unparsed_frames"] = safe_int(state.get("ws_unparsed_frames", 0)) + 1
+                print("ANGEL DIRECT WS UNPARSED FRAME: bytes=", len(message) if hasattr(message, "__len__") else -1, flush=True)
+                return
+
+            now = time.time()
+            state["websocket"] = "CONNECTED"
+            state["raw_ws_messages"] = safe_int(state.get("raw_ws_messages", 0)) + 1
+            state["ws_valid_frames"] = safe_int(state.get("ws_valid_frames", 0)) + 1
+            state["last_ws_message_at"] = now
+            state["last_market_packet_at"] = now
+            state["last_ws_token"] = parsed.get("token", "")
+            state["last_ws_mode"] = parsed.get("subscription_mode")
+            state["last_ws_exchange"] = parsed.get("exchange_type")
+
+            print(
+                "ANGEL DIRECT WS FRAME:",
+                "bytes=", len(message),
+                "mode=", parsed.get("subscription_mode"),
+                "exchange=", parsed.get("exchange_type"),
+                "token=", parsed.get("token"),
+                "raw_count=", state["raw_ws_messages"],
+                flush=True,
+            )
+
+            # Process the decoded packet directly in this same callback.
+            # This avoids a second callback layer obscuring where ticks stop.
+            try:
+                process_tick(parsed)
+                state["ws_processed_frames"] = safe_int(state.get("ws_processed_frames", 0)) + 1
                 print(
-                    "ANGEL DIRECT WS FRAME:",
-                    "bytes=", len(message),
-                    "mode=", parsed.get("subscription_mode"),
-                    "exchange=", parsed.get("exchange_type"),
+                    "ANGEL TICK PROCESSED:",
                     "token=", parsed.get("token"),
+                    "tick_count=", safe_int(state.get("tick_count", 0)),
+                    "nifty_ticks=", safe_int(state.get("nifty_tick_count", 0)),
+                    "option_ticks=", safe_int(state.get("option_tick_count", 0)),
                     flush=True,
                 )
-                # A binary Angel packet is real market-stream traffic. Keep a
-                # separate timestamp so the watchdog can detect a frozen feed
-                # even when websocket ping/pong is still healthy.
-                state["last_market_packet_at"] = time.time()
-                if self.on_data:
-                    self.on_data(self, parsed)
+            except Exception as tick_error:
+                state["ws_process_errors"] = safe_int(state.get("ws_process_errors", 0)) + 1
+                state["last_error"] = "Direct WS process_tick: " + str(tick_error)
+                print("ANGEL DIRECT WS PROCESS_TICK ERROR:", repr(tick_error), flush=True)
+
         except Exception as e:
+            state["ws_parse_errors"] = safe_int(state.get("ws_parse_errors", 0)) + 1
             state["last_error"] = "Direct WS parse: " + str(e)
             print("DIRECT WS PARSE ERROR:", repr(e), flush=True)
 
@@ -9013,6 +9042,20 @@ def health():
         "server": "LTP Master",
         "websocket": state.get("websocket", "UNKNOWN"),
         "raw_ws_messages": safe_int(state.get("raw_ws_messages", 0)),
+        "ws_valid_frames": safe_int(state.get("ws_valid_frames", 0)),
+        "ws_processed_frames": safe_int(state.get("ws_processed_frames", 0)),
+        "ws_unparsed_frames": safe_int(state.get("ws_unparsed_frames", 0)),
+        "ws_parse_errors": safe_int(state.get("ws_parse_errors", 0)),
+        "ws_process_errors": safe_int(state.get("ws_process_errors", 0)),
+        "last_ws_message_at": safe_float(state.get("last_ws_message_at", 0)),
+        "last_ws_token": state.get("last_ws_token", ""),
+        "last_ws_mode": state.get("last_ws_mode", ""),
+        "last_ws_exchange": state.get("last_ws_exchange", ""),
+        "tick_count": safe_int(state.get("tick_count", 0)),
+        "nifty_tick_count": safe_int(state.get("nifty_tick_count", 0)),
+        "option_tick_count": safe_int(state.get("option_tick_count", 0)),
+        "last_nifty_tick_at": safe_float(state.get("last_nifty_tick_at", 0)),
+        "last_option_tick_at": safe_float(state.get("last_option_tick_at", 0)),
         "last_error": state.get("last_error", ""),
         "time": now_string(),
     })
