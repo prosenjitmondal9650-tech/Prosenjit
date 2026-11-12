@@ -1,7 +1,7 @@
-Flask>=3.0,<4
+Flask>=3.0,<4.0
+requests>=2.31,<3.0
+websocket-client>=1.8,<2.0
+smartapi-python>=1.5.5
+pyotp>=2.9,<3.0
+logzero>=1.7,<2.0
 gunicorn>=22,<24
-requests>=2.31,<3
-websocket-client>=1.8,<2
-smartapi-python>=1.5,<2
-pyotp>=2.9,<3
-logzero==1.7.0

@@ -1,0 +1,27 @@
+# Python cache / virtual environments
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Runtime data / local caches
+*.log
+*.sqlite3
+*.db
+OpenAPIScripMaster.json
+nifty_oi_today_baseline.json
+nifty_shift_history_today.json
+last_traded_price_cache.json
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
