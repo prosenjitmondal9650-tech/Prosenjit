@@ -1,28 +1,13 @@
-"""Render/Gunicorn entry point; one worker is required for shared live state."""
-import importlib.util
-import os
-import sys
+"""Render/Gunicorn entry point. Starts the engine once per web process."""
 import threading
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SOURCE = os.path.join(BASE_DIR, "9_LTP_SHIFT_ENGINE_SR_FIXED_ANGEL_VOLUME_SYNC.py")
-if BASE_DIR not in sys.path:
-    sys.path.insert(0, BASE_DIR)
-if not os.path.isfile(SOURCE):
-    raise FileNotFoundError("LTP source file not found: " + SOURCE)
-
-spec = importlib.util.spec_from_file_location("ltp_engine", SOURCE)
-if spec is None or spec.loader is None:
-    raise ImportError("Unable to load LTP engine")
-engine = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = engine
-spec.loader.exec_module(engine)
+import app as engine
 
 app = engine.app
-_lock = threading.Lock()
-with _lock:
-    if not getattr(app, "_ltp_engine_started", False):
-        engine.startup()
-        app._ltp_engine_started = True
 
-application = app
+if not getattr(engine, "_render_startup_started", False):
+    engine._render_startup_started = True
+    threading.Thread(
+        target=engine.startup,
+        name="render-engine-startup",
+        daemon=True,
+    ).start()
