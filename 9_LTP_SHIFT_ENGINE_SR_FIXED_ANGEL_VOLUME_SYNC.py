@@ -1631,6 +1631,7 @@ def process_tick(message):
             nifty_time = nifty_data.get("time", "")
 
         state["last_nifty_tick_at"] = time.time()
+        state["nifty_tick_count"] = safe_int(state.get("nifty_tick_count", 0)) + 1
         state["tick_count"] = safe_int(state.get("tick_count", 0)) + 1
         state["live_tick_active"] = True
 
@@ -1804,6 +1805,7 @@ def process_tick(message):
         item["last_tick_received_ms"] = received_ms
 
         state["last_option_tick_at"] = received_ms / 1000.0
+        state["option_tick_count"] = safe_int(state.get("option_tick_count", 0)) + 1
         state["tick_count"] = safe_int(state.get("tick_count", 0)) + 1
 
         # Publish the changed option immediately. Browser updates these live cells.
@@ -2945,28 +2947,61 @@ class DirectAngelOneWS:
             self.on_open(self)
 
     def _on_message(self, wsapp, message):
-        state["raw_ws_messages"] = safe_int(state.get("raw_ws_messages", 0)) + 1
-        state["last_ws_message_at"] = time.time()
+        # Count only successfully decoded Angel market-data packets.
+        # Ping/pong and malformed frames must not inflate the live counter.
         if isinstance(message, str):
-            if message == "pong":
-                # Transport heartbeat only; never treat pong as a market-data tick.
+            if message.strip().lower() in ("pong", "ping", ""):
                 return
-            # Angel control/error messages are kept for diagnostics.
-            if message.strip():
-                state["last_error"] = "DIRECT WS TEXT: " + message[:300]
-                print("DIRECT WS TEXT:", message[:500], flush=True)
+            state["last_error"] = "DIRECT WS TEXT: " + message[:300]
+            print("DIRECT WS TEXT:", message[:500], flush=True)
             return
         try:
             parsed = self.parse_packet(message)
-            if parsed:
-                state["last_ws_token"] = parsed.get("token", "")
-                # A binary Angel packet is real market-stream traffic. Keep a
-                # separate timestamp so the watchdog can detect a frozen feed
-                # even when websocket ping/pong is still healthy.
-                state["last_market_packet_at"] = time.time()
-                if self.on_data:
-                    self.on_data(self, parsed)
+            if not parsed:
+                state["ws_unparsed_frames"] = safe_int(state.get("ws_unparsed_frames", 0)) + 1
+                print("ANGEL DIRECT WS UNPARSED FRAME: bytes=", len(message) if hasattr(message, "__len__") else -1, flush=True)
+                return
+
+            now = time.time()
+            state["websocket"] = "CONNECTED"
+            state["raw_ws_messages"] = safe_int(state.get("raw_ws_messages", 0)) + 1
+            state["ws_valid_frames"] = safe_int(state.get("ws_valid_frames", 0)) + 1
+            state["last_ws_message_at"] = now
+            state["last_market_packet_at"] = now
+            state["last_ws_token"] = parsed.get("token", "")
+            state["last_ws_mode"] = parsed.get("subscription_mode")
+            state["last_ws_exchange"] = parsed.get("exchange_type")
+
+            print(
+                "ANGEL DIRECT WS FRAME:",
+                "bytes=", len(message),
+                "mode=", parsed.get("subscription_mode"),
+                "exchange=", parsed.get("exchange_type"),
+                "token=", parsed.get("token"),
+                "raw_count=", state["raw_ws_messages"],
+                flush=True,
+            )
+
+            # Process the decoded packet directly in this same callback.
+            # This avoids a second callback layer obscuring where ticks stop.
+            try:
+                process_tick(parsed)
+                state["ws_processed_frames"] = safe_int(state.get("ws_processed_frames", 0)) + 1
+                print(
+                    "ANGEL TICK PROCESSED:",
+                    "token=", parsed.get("token"),
+                    "tick_count=", safe_int(state.get("tick_count", 0)),
+                    "nifty_ticks=", safe_int(state.get("nifty_tick_count", 0)),
+                    "option_ticks=", safe_int(state.get("option_tick_count", 0)),
+                    flush=True,
+                )
+            except Exception as tick_error:
+                state["ws_process_errors"] = safe_int(state.get("ws_process_errors", 0)) + 1
+                state["last_error"] = "Direct WS process_tick: " + str(tick_error)
+                print("ANGEL DIRECT WS PROCESS_TICK ERROR:", repr(tick_error), flush=True)
+
         except Exception as e:
+            state["ws_parse_errors"] = safe_int(state.get("ws_parse_errors", 0)) + 1
             state["last_error"] = "Direct WS parse: " + str(e)
             print("DIRECT WS PARSE ERROR:", repr(e), flush=True)
 
@@ -3105,12 +3140,41 @@ def websocket_on_open(wsapp):
         print("ANGEL SMART WS SUBSCRIBE ERROR:", repr(e), flush=True)
 
 
-def websocket_on_data(wsapp, message):
+def websocket_on_data(wsapp, message, *callback_extra):
+    """Accept both SmartApi SDK callback payloads and raw binary frames.
+
+    SDK releases have differed in the callback argument shape.  Keep the
+    callback tolerant, but count only actual market-data payloads (not pongs).
+    """
     try:
+        payload = message
+        if isinstance(payload, str):
+            if payload.strip().lower() in ("pong", "ping", ""):
+                return
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                state["last_error"] = "Angel WS text frame: " + payload[:250]
+                print("ANGEL WS TEXT FRAME:", payload[:300], flush=True)
+                return
+
+        if isinstance(payload, (bytes, bytearray)):
+            payload = DirectAngelOneWS.parse_packet(payload)
+            if payload is None:
+                state["last_error"] = "Angel WS binary frame could not be decoded"
+                return
+
+        if isinstance(payload, dict) and isinstance(payload.get("data"), dict) and not payload.get("token"):
+            payload = payload["data"]
+
+        if not isinstance(payload, dict):
+            state["last_error"] = "Unsupported Angel WS payload: " + type(payload).__name__
+            return
+
         state["raw_ws_messages"] = safe_int(state.get("raw_ws_messages", 0)) + 1
         state["last_ws_message_at"] = time.time()
         state["last_market_packet_at"] = time.time()
-        process_tick(message)
+        process_tick(payload)
     except Exception as e:
         state["last_error"] = "WebSocket tick error: " + str(e)
         print("ANGEL ONE WS TICK ERROR:", repr(e), flush=True)
@@ -3125,27 +3189,33 @@ def websocket_on_error(wsapp=None, error=None, *extra):
     state["websocket"] = "ERROR"
     state["last_error"] = "Angel Smart Stream: " + str(reason)
     print("ANGEL ONE WS ERROR RAW:", repr(reason), flush=True)
+    # Force the outer reconnect loop to regain control if the SDK leaves a
+    # failed socket open after an error callback.
+    current = active_sws
+    if current is not None:
+        try:
+            current.close_connection()
+        except Exception as close_error:
+            print("Angel WS close-after-error warning:", repr(close_error), flush=True)
 
 
-def websocket_on_close(wsapp):
+def websocket_on_close(wsapp=None, *close_details):
     global subscribed_option_tokens
     state["websocket"] = "DISCONNECTED"
+    if close_details:
+        state["last_error"] = "Angel Smart Stream closed: " + " ".join(str(x) for x in close_details)[:250]
     with subscribed_tokens_lock:
         subscribed_option_tokens = set()
-    print("Angel One SmartWebSocketV2 closed.", flush=True)
+    print("Angel One SmartWebSocketV2 closed; reconnect loop will retry.", flush=True)
 
 
 def start_websocket():
-    """Run Angel One's official SmartWebSocketV2 directly.
-
-    This removes the custom WebSocketApp wrapper that caused subscribe() to be
-    called on the wrong object. The official SDK owns the raw socket and its
-    subscribe/resubscribe protocol.
-    """
+    """Run Angel One SmartWebSocketV2 with an explicit outer reconnect loop."""
     global ws, feed_token, active_sws
     print("Starting OFFICIAL Angel One SmartWebSocketV2", flush=True)
     failure_count = 0
     while running:
+        client = None
         try:
             if not state.get("logged_in"):
                 if not angel_login():
@@ -3160,31 +3230,54 @@ def start_websocket():
                 raise RuntimeError("Feed token unavailable")
 
             state["websocket"] = "CONNECTING"
-            client = SmartWebSocketV2(
-                token, API_KEY, CLIENT_CODE, feed_token,
-                max_retry_attempt=2, retry_strategy=0,
-                retry_delay=5, retry_duration=30,
-            )
+            state["last_error"] = ""
+            state["ws_connect_started_at"] = time.time()
+            state["ws_reconnects"] = safe_int(state.get("ws_reconnects", 0)) + (1 if failure_count else 0)
+            # Bypass the SDK wrapper so every raw Smart Stream frame is
+            # visible to our own decoder and diagnostics before tick processing.
+            client = DirectAngelOneWS(token, API_KEY, CLIENT_CODE, feed_token)
             active_sws = client
             ws = client
             client.on_open = websocket_on_open
             client.on_data = websocket_on_data
             client.on_error = websocket_on_error
             client.on_close = websocket_on_close
+            print("Angel Direct Smart Stream connect() starting; SDK wrapper bypassed", flush=True)
             client.connect()
-            failure_count = 0
+            # connect() normally blocks until the socket closes. If it returns,
+            # treat that as a disconnect rather than silently starting over.
+            failure_count += 1
+            state["websocket"] = "DISCONNECTED"
+            state["last_error"] = "Angel Smart Stream ended; reconnecting"
+            print("Angel SmartWebSocketV2 connect() returned; reconnecting", flush=True)
         except Exception as e:
             failure_count += 1
             state["websocket"] = "ERROR"
             state["last_error"] = "Angel Smart WS connection: " + str(e)
             print("ANGEL SMART WS CONNECTION ERROR:", repr(e), flush=True)
-            if failure_count >= 3:
+        finally:
+            if client is not None:
                 try:
-                    relogin()
-                except Exception as re:
-                    print("ANGEL SMART WS re-login error:", repr(re), flush=True)
-                failure_count = 0
-            time.sleep(WS_RECONNECT_SECONDS)
+                    client.close_connection()
+                except Exception:
+                    pass
+            if active_sws is client:
+                active_sws = None
+            if ws is client:
+                ws = None
+            with subscribed_tokens_lock:
+                subscribed_option_tokens.clear()
+
+        if not running:
+            break
+        if failure_count >= 3:
+            try:
+                print("Angel WS reconnect threshold reached; refreshing login session", flush=True)
+                relogin()
+            except Exception as re:
+                print("ANGEL SMART WS re-login error:", repr(re), flush=True)
+            failure_count = 0
+        time.sleep(WS_RECONNECT_SECONDS)
 
 # ============================================================
 # WEBSOCKET WATCHDOG
@@ -3199,10 +3292,10 @@ def websocket_watchdog_loop():
                 # can legitimately be quiet.
                 last_market = safe_float(state.get("last_market_packet_at", 0))
                 age = time.time() - last_market if last_market > 0 else 999
-                if is_market_open() and age > 12:
-                    state["last_error"] = f"Direct WS watchdog: no market tick for {age:.1f}s; reconnecting"
-                    print(f"DIRECT WS WATCHDOG: no market tick for {age:.1f}s", flush=True)
-                    current = ws
+                if is_market_open() and age > 15:
+                    state["last_error"] = f"Angel WS watchdog: no market-data frame for {age:.1f}s; reconnecting"
+                    print(f"ANGEL WS WATCHDOG: no market-data frame for {age:.1f}s; reconnecting", flush=True)
+                    current = active_sws or ws
                     if current is not None:
                         current.close_connection()
             time.sleep(1)
@@ -5196,6 +5289,44 @@ def api_place_order():
 # POSITIONS
 # ============================================================
 
+def angel_sdk_call_with_relogin(method_name, *args, **kwargs):
+    """Call an authenticated Angel SDK method and refresh an expired session once.
+
+    Render can keep a process alive longer than an Angel JWT.  SDK methods such
+    as position() may return AG8001 in a JSON response instead of raising, so
+    inspect both the response and exceptions before deciding the call succeeded.
+    """
+    global obj
+    method = getattr(obj, method_name, None) if obj is not None else None
+    if not callable(method):
+        if not angel_login():
+            raise RuntimeError(state.get("last_error") or "Angel One login failed")
+        method = getattr(obj, method_name, None)
+    if not callable(method):
+        raise RuntimeError("Angel One SDK method unavailable: " + str(method_name))
+
+    try:
+        result = method(*args, **kwargs)
+        if _greeks_auth_error(result):
+            raise RuntimeError("AG8001: Invalid Token")
+        return result
+    except Exception as exc:
+        message = str(exc).lower()
+        auth_failed = any(code in message for code in ("ag8001", "ab1010", "ab1011", "invalid token", "token expired"))
+        if not auth_failed:
+            raise
+        print("ANGEL SDK: expired JWT detected in", method_name, "-> refreshing session", flush=True)
+        if not angel_login():
+            raise RuntimeError(state.get("last_error") or "Angel One re-login failed") from exc
+        method = getattr(obj, method_name, None)
+        if not callable(method):
+            raise RuntimeError("Angel One SDK method unavailable after re-login: " + str(method_name))
+        result = method(*args, **kwargs)
+        if _greeks_auth_error(result):
+            raise RuntimeError("Angel One still reports AG8001 after fresh login")
+        return result
+
+
 @app.get("/api/positions")
 def api_positions():
 
@@ -5212,7 +5343,7 @@ def api_positions():
 
     try:
 
-        response = obj.position()
+        response = angel_sdk_call_with_relogin("position")
 
         if not response:
 
@@ -5427,7 +5558,7 @@ def api_square_off():
 
     try:
 
-        positions = obj.position()
+        positions = angel_sdk_call_with_relogin("position")
 
         rows = (
             positions.get("data")
@@ -6791,9 +6922,14 @@ function ltpCell(
     close = 0
 ) {
 
-    // STRICT LTP DISPLAY: never substitute previous close for LTP.
-    // The close is historical data, not the live traded price.
-    const n = Number(value);
+    // During the live session show only the live LTP. After the market
+    // closes, fall back to the last saved closing/last-traded value.
+    const liveValue = Number(value);
+    const closeValue = Number(close);
+    const marketClosed = currentData && currentData.market_open === false;
+    const n = marketClosed && (!Number.isFinite(liveValue) || liveValue <= 0)
+        && Number.isFinite(closeValue) && closeValue > 0
+        ? closeValue : liveValue;
 
     if (
         !Number.isFinite(n)
@@ -7577,11 +7713,16 @@ function updateHeaderFromPayload(data) {
             diagnostic.textContent = "WS CONNECTED • NO FRESH TICK • RAW: " + (data.raw_ws_messages || 0) + " • LAST TOKEN: " + (data.last_ws_token || "--");
         }
     }
-    // STRICT LIVE LTP: do not show previous close as Spot while waiting
-    // for an Angel One live tick.
+    // Live session: show live LTP. Closed session: show the saved close
+    // if a live LTP is unavailable.
     const liveNiftyLtp = Number(data.nifty?.ltp || 0);
+    const savedNiftyClose = Number(data.nifty?.close || 0);
+    const shownNifty = liveNiftyLtp > 0 ? liveNiftyLtp
+        : (data.market_open === false && savedNiftyClose > 0 ? savedNiftyClose : 0);
     const spot = document.getElementById("spot");
-    if (spot) spot.textContent = "Spot: " + (liveNiftyLtp > 0 ? fmt(liveNiftyLtp) : "--") + " [" + (data.nifty?.ltp_source || "WAITING") + "]";
+    const spotSource = liveNiftyLtp > 0 ? (data.nifty?.ltp_source || "LIVE")
+        : (shownNifty > 0 ? "LAST CLOSE" : "WAITING");
+    if (spot) spot.textContent = "Spot: " + (shownNifty > 0 ? fmt(shownNifty) : "--") + " [" + spotSource + "]";
     const atm = document.getElementById("atm");
     if (atm) atm.textContent = "ATM: " + fmt(data.atm, 0);
     const wsEl = document.getElementById("ws");
@@ -7696,6 +7837,8 @@ function applyTickDelta(d) {
         return;
     }
     if (d.type === "nifty") {
+        // A real NIFTY delta proves the server stream is delivering live data.
+        // Refresh the status label from the latest server payload when present.
         const n = Number(d.ltp || 0);
         window.liveStreamHasTicks = true;
         if (currentData) {
@@ -7708,6 +7851,11 @@ function applyTickDelta(d) {
         updateLiveCandleFromTick(n, Number(d.tick_ms || Date.now()), Number(d.volume || 0));
         const spot = document.getElementById("spot");
         if (spot && n > 0) spot.textContent = "Spot: " + fmt(n) + " [LIVE]";
+        const diag = document.getElementById("diagnostic") || document.getElementById("error");
+        if (diag) {
+            diag.textContent = "LIVE RAW TICK • ANGEL ONE • NIFTY: LIVE";
+            diag.title = "Live NIFTY tick received by the browser SSE stream";
+        }
         return;
     }
     if (d.type !== "option") return;
@@ -7738,7 +7886,11 @@ function connectTickStream() {
     if (tickStream) tickStream.close();
     tickStream = new EventSource(window.location.origin + "/api/tick-stream");
     tickStream.addEventListener("snapshot", ev => {
-        try { applyTickDelta(JSON.parse(ev.data)); } catch(e) { console.error(e); }
+        // /api/tick-stream sends an SSE envelope:
+        // {type:"full_snapshot", payload:{...}}.
+        // Unwrap it through applyTickDelta before rendering the payload.
+        try { applyTickDelta(JSON.parse(ev.data)); }
+        catch(e) { console.error("SSE snapshot apply error:", e); }
     });
     tickStream.addEventListener("tick", ev => {
         try { applyTickDelta(JSON.parse(ev.data)); } catch(e) { console.error(e); }
@@ -8890,6 +9042,20 @@ def health():
         "server": "LTP Master",
         "websocket": state.get("websocket", "UNKNOWN"),
         "raw_ws_messages": safe_int(state.get("raw_ws_messages", 0)),
+        "ws_valid_frames": safe_int(state.get("ws_valid_frames", 0)),
+        "ws_processed_frames": safe_int(state.get("ws_processed_frames", 0)),
+        "ws_unparsed_frames": safe_int(state.get("ws_unparsed_frames", 0)),
+        "ws_parse_errors": safe_int(state.get("ws_parse_errors", 0)),
+        "ws_process_errors": safe_int(state.get("ws_process_errors", 0)),
+        "last_ws_message_at": safe_float(state.get("last_ws_message_at", 0)),
+        "last_ws_token": state.get("last_ws_token", ""),
+        "last_ws_mode": state.get("last_ws_mode", ""),
+        "last_ws_exchange": state.get("last_ws_exchange", ""),
+        "tick_count": safe_int(state.get("tick_count", 0)),
+        "nifty_tick_count": safe_int(state.get("nifty_tick_count", 0)),
+        "option_tick_count": safe_int(state.get("option_tick_count", 0)),
+        "last_nifty_tick_at": safe_float(state.get("last_nifty_tick_at", 0)),
+        "last_option_tick_at": safe_float(state.get("last_option_tick_at", 0)),
         "last_error": state.get("last_error", ""),
         "time": now_string(),
     })
@@ -8932,6 +9098,151 @@ def _cloud_recorder_post(table, rows, on_conflict=None):
             f"Supabase {table}: HTTP {response.status_code}: "
             f"{response.text[:500]}"
         )
+
+
+def load_last_ltp_from_supabase():
+    """Restore the most recent saved NIFTY quote after a Render restart.
+
+    Render's local filesystem is ephemeral, so LAST_LTP_CACHE alone cannot
+    guarantee a last-traded price outside market hours.  The cloud snapshot
+    table is the durable fallback.  This function is intentionally used only
+    while the exchange is closed; it never overwrites a live-session quote.
+    """
+    if is_market_open():
+        return False
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        print("SUPABASE LTP RESTORE SKIPPED: credentials not configured.", flush=True)
+        return False
+
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_SNAPSHOT_TABLE}"
+        # Search recent records for the newest VALID quote. The recorder can
+        # also write zero-valued diagnostic snapshots while Angel's stream is
+        # disconnected; those must not hide an older valid market snapshot.
+        params = {
+            "select": "id,snapshot_time,nifty,last_update",
+            "order": "snapshot_time.desc,id.desc",
+            "limit": "500",
+        }
+        response = requests.get(
+            url, headers=_cloud_recorder_headers(), params=params,
+            timeout=(5, 20),
+        )
+        if response.status_code >= 300:
+            raise RuntimeError(
+                f"HTTP {response.status_code}: {response.text[:400]}"
+            )
+        records = response.json() or []
+        if not records:
+            print("SUPABASE LTP RESTORE: no saved snapshots found.", flush=True)
+            return False
+
+        record = None
+        for candidate in records:
+            candidate_quote = candidate.get("nifty") or {}
+            if not isinstance(candidate_quote, dict):
+                continue
+            candidate_ltp = safe_float(candidate_quote.get("ltp"))
+            candidate_close = safe_float(candidate_quote.get("close"))
+            if candidate_ltp > 0 or candidate_close > 0:
+                record = candidate
+                break
+        if record is None:
+            print("SUPABASE LTP RESTORE: no snapshot contains a positive LTP/close.", flush=True)
+            return False
+
+        # Fetch the option-chain JSON only for the selected valid snapshot,
+        # avoiding a large response containing hundreds of historical chains.
+        record_id = record.get("id")
+        if record_id is not None:
+            rows_response = requests.get(
+                url,
+                headers=_cloud_recorder_headers(),
+                params={"select": "rows,expiry", "id": f"eq.{record_id}", "limit": "1"},
+                timeout=(5, 15),
+            )
+            if rows_response.status_code >= 300:
+                raise RuntimeError(
+                    f"Supabase option snapshot HTTP {rows_response.status_code}: "
+                    f"{rows_response.text[:300]}"
+                )
+            row_records = rows_response.json() or []
+            if row_records:
+                record["rows"] = row_records[0].get("rows") or []
+                record["expiry"] = row_records[0].get("expiry")
+
+        quote = record.get("nifty") or {}
+        if not isinstance(quote, dict):
+            quote = {}
+        ltp = safe_float(quote.get("ltp"))
+        close = safe_float(quote.get("close"))
+        # Prefer the last actual trade; use the broker close only if no LTP
+        # was captured in the selected snapshot.
+        restored_price = ltp if ltp > 0 else close
+        if restored_price <= 0:
+            print("SUPABASE LTP RESTORE: selected snapshot has no positive LTP/close.", flush=True)
+            return False
+
+        stamp = str(
+            quote.get("ltp_updated") or quote.get("time") or
+            record.get("last_update") or record.get("snapshot_time") or ""
+        )
+        restored_option_count = 0
+        saved_rows = record.get("rows") or []
+        with data_lock:
+            # Cloud is the persistent latest snapshot and therefore supersedes
+            # any older local cache after a container restart.
+            nifty_data["ltp"] = restored_price
+            if close > 0:
+                nifty_data["close"] = close
+            for field in ("open", "high", "low", "change", "percent_change"):
+                value = safe_float(quote.get(field))
+                if value or field in ("change", "percent_change"):
+                    nifty_data[field] = value
+            nifty_data["time"] = str(quote.get("time") or stamp)
+            nifty_data["ltp_source"] = "LAST TRADED (SUPABASE)"
+            nifty_data["ltp_updated"] = stamp
+
+            # Restore the last saved option-chain values too. These are
+            # historical snapshot values, not falsely labelled live ticks.
+            for saved_row in saved_rows:
+                if not isinstance(saved_row, dict):
+                    continue
+                for side in ("ce", "pe"):
+                    option = saved_row.get(side) or {}
+                    if not isinstance(option, dict):
+                        continue
+                    symbol = str(option.get("symbol") or "").strip()
+                    if not symbol:
+                        continue
+                    option_ltp = safe_float(option.get("ltp"))
+                    option_close = safe_float(option.get("close"))
+                    option_price = option_ltp if option_ltp > 0 else option_close
+                    target = ensure_live_symbol(symbol)
+                    if option_price > 0:
+                        target["ltp"] = option_price
+                    if option_close > 0:
+                        target["close"] = option_close
+                    target["volume"] = safe_int(option.get("volume"))
+                    target["oi"] = safe_int(option.get("oi"))
+                    target["oi_change"] = safe_int(option.get("oi_change"))
+                    target["percent_change"] = safe_float(option.get("percent_change"))
+                    target["ltp_source"] = "LAST SNAPSHOT (SUPABASE)"
+                    target["ltp_updated"] = stamp
+                    target["time"] = stamp
+                    restored_option_count += 1
+
+        save_ltp_cache()
+        print(
+            "SUPABASE LAST TRADED NIFTY LTP RESTORED:",
+            f"{restored_price:.2f}", stamp,
+            "| OPTION SNAPSHOT ROWS:", restored_option_count,
+            flush=True,
+        )
+        return True
+    except Exception as restore_error:
+        print("SUPABASE LTP RESTORE ERROR:", repr(restore_error), flush=True)
+        return False
 
 
 def _cloud_event_key(date_s, side, event):
@@ -8985,16 +9296,15 @@ def _cloud_recorder_save_payload(payload):
                 "raw_event": event,
             })
 
-    # IMPORTANT: do not create a recorder entry/snapshot when there is no
-    # completed SHIFT. This keeps total entries equal to actual shifts only.
-    if not shift_rows:
-        return
-
-    _cloud_recorder_post(
-        SUPABASE_SHIFT_TABLE, shift_rows, "event_key"
-    )
-    for row in shift_rows:
-        cloud_recorder_seen_events.add(row["event_key"])
+    # Persist only actual SHIFT events in the history table, but always
+    # persist the latest market snapshot. This preserves last-known data even
+    # during quiet periods when no new shift event is generated.
+    if shift_rows:
+        _cloud_recorder_post(
+            SUPABASE_SHIFT_TABLE, shift_rows, "event_key"
+        )
+        for row in shift_rows:
+            cloud_recorder_seen_events.add(row["event_key"])
 
     snapshot = {
         "snapshot_time": now.isoformat(),
@@ -9021,6 +9331,7 @@ def _cloud_recorder_save_payload(payload):
 
 def _cloud_recorder_loop():
     global cloud_recorder_running
+    close_snapshot_saved_date = ""
 
     with cloud_recorder_lock:
         cloud_recorder_running = True
@@ -9029,9 +9340,34 @@ def _cloud_recorder_loop():
         while not cloud_recorder_stop.is_set():
             now = now_ist()
 
-            if now.weekday() >= 5 or now.time() > datetime.strptime(
-                "15:30", "%H:%M"
-            ).time():
+            # Capture one final end-of-session snapshot from today's last
+            # received Angel tick. Never write an empty post-restart value.
+            if now.weekday() < 5 and now.time() > datetime.strptime("15:30", "%H:%M").time():
+                date_s = now.strftime("%Y-%m-%d")
+                last_tick = safe_float(state.get("last_nifty_tick_at", 0))
+                last_price = safe_float(nifty_data.get("ltp"))
+                tick_is_today = False
+                if last_tick > 0:
+                    try:
+                        tick_is_today = datetime.fromtimestamp(last_tick, IST).date() == now.date()
+                    except Exception:
+                        tick_is_today = False
+                tick_is_fresh = last_tick > 0 and (time.time() - last_tick) <= 600
+                if (close_snapshot_saved_date != date_s and tick_is_today
+                        and tick_is_fresh and last_price > 0):
+                    try:
+                        final_payload = make_payload()
+                        _cloud_recorder_save_payload(final_payload)
+                        close_snapshot_saved_date = date_s
+                        print("CLOUD RECORDER FINAL CLOSE SNAPSHOT SAVED:", date_s,
+                              f"NIFTY={last_price:.2f}", flush=True)
+                    except Exception as close_error:
+                        print("CLOUD RECORDER FINAL CLOSE SNAPSHOT WARNING:",
+                              repr(close_error), flush=True)
+                cloud_recorder_stop.wait(30)
+                continue
+
+            if now.weekday() >= 5:
                 cloud_recorder_stop.wait(30)
                 continue
 
@@ -9202,6 +9538,9 @@ def startup():
     # During closed hours it remains useful as the requested last-known fallback.
     if not is_market_open():
         load_ltp_cache()
+        # Prefer the persistent cloud snapshot over Render's ephemeral local
+        # cache so the previous trading session's LTP survives restarts.
+        load_last_ltp_from_supabase()
 
     # --------------------------------------------------------
     # Login.
