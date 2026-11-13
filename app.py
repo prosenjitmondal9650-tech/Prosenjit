@@ -7548,6 +7548,7 @@ updatePositions();
 // TRUE TICK-BY-TICK LIVE STREAM
 // ==========================================================
 let tickStream = null;
+let tickReconnectTimer = null;
 window.liveStreamHasTicks = false;
 
 function applyLivePayload(data) {
@@ -7744,6 +7745,18 @@ function connectTickStream() {
     }
     if (tickStream) tickStream.close();
     tickStream = new EventSource(window.location.origin + "/api/tick-stream");
+    // A single native EventSource should be allowed to reconnect. The old
+    // 1.5s backstop recreated it even while it was CONNECTING, repeatedly
+    // closing a healthy retry and leaving the dashboard stuck after its first
+    // snapshot. Only recreate after the browser reports CLOSED.
+    tickStream.addEventListener("open", () => {
+        if (tickReconnectTimer) {
+            clearTimeout(tickReconnectTimer);
+            tickReconnectTimer = null;
+        }
+        const wsEl = document.getElementById("ws");
+        if (wsEl) wsEl.textContent = "SERVER STREAM: CONNECTED";
+    });
     tickStream.addEventListener("snapshot", ev => {
         try { applyLivePayload(JSON.parse(ev.data)); } catch(e) { console.error(e); }
     });
@@ -7753,11 +7766,14 @@ function connectTickStream() {
     tickStream.onerror = () => {
         const wsEl = document.getElementById("ws");
         if (wsEl) wsEl.textContent = "SERVER STREAM: RECONNECTING...";
-        // EventSource normally retries itself. Keep our own timer as a
-        // backstop for browsers/proxies that leave a half-open stream.
-        setTimeout(() => {
-            if (!tickStream || tickStream.readyState !== EventSource.OPEN) connectTickStream();
-        }, 1500);
+        // CONNECTING means the browser is already retrying; do not close it.
+        // Use one delayed fallback only if it eventually becomes CLOSED.
+        if (tickStream && tickStream.readyState === EventSource.CLOSED && !tickReconnectTimer) {
+            tickReconnectTimer = setTimeout(() => {
+                tickReconnectTimer = null;
+                if (!tickStream || tickStream.readyState === EventSource.CLOSED) connectTickStream();
+            }, 5000);
+        }
     };
 }
 

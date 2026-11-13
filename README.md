@@ -90,3 +90,14 @@ status to display `DISCONNECTED / RAW: 0` even while Render logs showed
 Angel One binary frames arriving. A received NIFTY delta also updates the
 visible diagnostic label to confirm browser-side delivery.
 
+
+## Browser SSE reconnect stability fix (2026-11-13)
+- The browser no longer forcibly closes an EventSource while its built-in retry
+  is in the `CONNECTING` state. The previous 1.5-second fallback could repeatedly
+  restart the stream and leave the dashboard showing only its first snapshot.
+- A single delayed fallback is used only if EventSource reaches `CLOSED`.
+- The Angel WebSocket watchdog now closes a socket that remains open in `ERROR`
+  after a subscription/authentication failure, allowing the outer reconnect loop
+  to run again instead of hanging indefinitely.
+- Both the Render engine entry file and the standalone `app.py` dashboard copy
+  contain the same browser reconnect correction.
