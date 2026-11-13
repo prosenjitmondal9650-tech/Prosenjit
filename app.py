@@ -120,7 +120,7 @@ WS_RECONNECT_SECONDS = 5
 
 REST_POLL_SECONDS = 0
 OPTION_REST_POLL_SECONDS = 0
-GREEKS_REFRESH_SECONDS = 3  # Fast official Angel Greeks snapshot refresh; Greeks are REST snapshots, not WebSocket ticks.
+GREEKS_REFRESH_SECONDS = 60  # Official Angel Greeks are REST snapshots; refresh once per minute during market hours.
 
 STRIKES_AROUND_ATM = int(
     os.getenv(
@@ -2514,6 +2514,11 @@ def seed_opening_oi_baseline_from_angel():
     dummy/garbage value, so we must not derive the app's OI change from it.
     """
     if not state.get("logged_in") or not selected_expiry:
+        return
+    # Angel historical OI has no 09:15 opening observation before the cash market opens.
+    # Avoid a guaranteed empty request during pre-market startup.
+    if not is_market_open():
+        print("ANGEL opening OI baseline deferred until NSE market hours", flush=True)
         return
     today = today_string()
     with baseline_lock:
@@ -9251,11 +9256,13 @@ def startup():
             except Exception as seed_error:
                 print("Initial Angel REST seed warning:", repr(seed_error), flush=True)
 
-        # Fetch official Angel Greeks once for the selected expiry.  Greeks are
-        # not part of Smart Stream ticks, so there is intentionally no 5-second
-        # Greeks polling loop.
-        if state.get("logged_in"):
+        # Fetch official Angel Greeks only during NSE market hours. Angel may
+        # return AB9019 (No Data Available) during pre-market startup; retrying
+        # then only creates noise and does not provide a usable live snapshot.
+        if state.get("logged_in") and is_market_open():
             fetch_option_greeks()
+        elif state.get("logged_in"):
+            print("ANGEL Greeks startup fetch deferred until NSE market hours", flush=True)
 
     except Exception as e:
 
@@ -9309,7 +9316,7 @@ def startup():
     def _greeks_refresh_loop():
         while True:
             try:
-                time.sleep(max(3, int(GREEKS_REFRESH_SECONDS or 3)))
+                time.sleep(max(30, int(GREEKS_REFRESH_SECONDS or 60)))
                 if state.get("logged_in") and is_market_open():
                     fetch_option_greeks()
             except Exception as greeks_loop_error:
